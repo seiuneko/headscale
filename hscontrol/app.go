@@ -24,17 +24,19 @@ import (
 	grpcRuntime "github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
 	"github.com/juanfont/headscale"
 	v1 "github.com/juanfont/headscale/gen/go/headscale/v1"
+	"github.com/juanfont/headscale/hscontrol/capver"
 	"github.com/juanfont/headscale/hscontrol/db"
 	"github.com/juanfont/headscale/hscontrol/derp"
 	derpServer "github.com/juanfont/headscale/hscontrol/derp/server"
+	"github.com/juanfont/headscale/hscontrol/dns"
 	"github.com/juanfont/headscale/hscontrol/mapper"
 	"github.com/juanfont/headscale/hscontrol/notifier"
 	"github.com/juanfont/headscale/hscontrol/policy"
+	"github.com/juanfont/headscale/hscontrol/routes"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/util"
 	zerolog "github.com/philip-bui/grpc-zerolog"
 	"github.com/pkg/profile"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 	zl "github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"golang.org/x/crypto/acme"
@@ -88,13 +90,15 @@ type Headscale struct {
 	DERPMap    *tailcfg.DERPMap
 	DERPServer *derpServer.DERPServer
 
-	polManOnce sync.Once
-	polMan     policy.PolicyManager
+	polManOnce     sync.Once
+	polMan         policy.PolicyManager
+	extraRecordMan *dns.ExtraRecordsMan
+	primaryRoutes  *routes.PrimaryRoutes
 
 	mapper       *mapper.Mapper
 	nodeNotifier *notifier.Notifier
 
-	registrationCache *zcache.Cache[string, types.Node]
+	registrationCache *zcache.Cache[types.RegistrationID, types.RegisterNode]
 
 	authProvider AuthProvider
 
@@ -121,7 +125,7 @@ func NewHeadscale(cfg *types.Config) (*Headscale, error) {
 		return nil, fmt.Errorf("failed to read or create Noise protocol private key: %w", err)
 	}
 
-	registrationCache := zcache.New[string, types.Node](
+	registrationCache := zcache.New[types.RegistrationID, types.RegisterNode](
 		registerCacheExpiration,
 		registerCacheCleanup,
 	)
@@ -132,6 +136,7 @@ func NewHeadscale(cfg *types.Config) (*Headscale, error) {
 		registrationCache:  registrationCache,
 		pollNetMapStreamWG: sync.WaitGroup{},
 		nodeNotifier:       notifier.NewNotifier(cfg),
+		primaryRoutes:      routes.New(),
 	}
 
 	app.db, err = db.NewHeadscaleDatabase(
@@ -140,7 +145,7 @@ func NewHeadscale(cfg *types.Config) (*Headscale, error) {
 		registrationCache,
 	)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("new database: %w", err)
 	}
 
 	app.ipAlloc, err = db.NewIPAllocator(app.db, cfg.PrefixV4, cfg.PrefixV6, cfg.IPAllocation)
@@ -155,7 +160,7 @@ func NewHeadscale(cfg *types.Config) (*Headscale, error) {
 	})
 
 	if err = app.loadPolicyManager(); err != nil {
-		return nil, fmt.Errorf("failed to load ACL policy: %w", err)
+		return nil, fmt.Errorf("loading ACL policy: %w", err)
 	}
 
 	var authProvider AuthProvider
@@ -184,23 +189,27 @@ func NewHeadscale(cfg *types.Config) (*Headscale, error) {
 	}
 	app.authProvider = authProvider
 
-	if app.cfg.DNSConfig != nil && app.cfg.DNSConfig.Proxied { // if MagicDNS
+	if app.cfg.TailcfgDNSConfig != nil && app.cfg.TailcfgDNSConfig.Proxied { // if MagicDNS
 		// TODO(kradalby): revisit why this takes a list.
 
 		var magicDNSDomains []dnsname.FQDN
 		if cfg.PrefixV4 != nil {
-			magicDNSDomains = append(magicDNSDomains, util.GenerateIPv4DNSRootDomain(*cfg.PrefixV4)...)
+			magicDNSDomains = append(
+				magicDNSDomains,
+				util.GenerateIPv4DNSRootDomain(*cfg.PrefixV4)...)
 		}
 		if cfg.PrefixV6 != nil {
-			magicDNSDomains = append(magicDNSDomains, util.GenerateIPv6DNSRootDomain(*cfg.PrefixV6)...)
+			magicDNSDomains = append(
+				magicDNSDomains,
+				util.GenerateIPv6DNSRootDomain(*cfg.PrefixV6)...)
 		}
 
 		// we might have routes already from Split DNS
-		if app.cfg.DNSConfig.Routes == nil {
-			app.cfg.DNSConfig.Routes = make(map[string][]*dnstype.Resolver)
+		if app.cfg.TailcfgDNSConfig.Routes == nil {
+			app.cfg.TailcfgDNSConfig.Routes = make(map[string][]*dnstype.Resolver)
 		}
 		for _, d := range magicDNSDomains {
-			app.cfg.DNSConfig.Routes[d.WithoutTrailingDot()] = nil
+			app.cfg.TailcfgDNSConfig.Routes[d.WithoutTrailingDot()] = nil
 		}
 	}
 
@@ -218,7 +227,7 @@ func NewHeadscale(cfg *types.Config) (*Headscale, error) {
 		}
 
 		if cfg.DERP.ServerVerifyClients {
-			t := http.DefaultTransport.(*http.Transport) //nolint:forcetypeassert
+			t := http.DefaultTransport.(*http.Transport)
 			t.RegisterProtocol(
 				derpServer.DerpVerifyScheme,
 				derpServer.NewDERPVerifyTransport(app.handleVerifyRequest),
@@ -245,23 +254,38 @@ func (h *Headscale) redirect(w http.ResponseWriter, req *http.Request) {
 	http.Redirect(w, req, target, http.StatusFound)
 }
 
-// expireExpiredNodes expires nodes that have an explicit expiry set
-// after that expiry time has passed.
-func (h *Headscale) expireExpiredNodes(ctx context.Context, every time.Duration) {
-	ticker := time.NewTicker(every)
+func (h *Headscale) scheduledTasks(ctx context.Context) {
+	expireTicker := time.NewTicker(updateInterval)
+	defer expireTicker.Stop()
 
-	lastCheck := time.Unix(0, 0)
-	var update types.StateUpdate
-	var changed bool
+	lastExpiryCheck := time.Unix(0, 0)
+
+	derpTickerChan := make(<-chan time.Time)
+	if h.cfg.DERP.AutoUpdate && h.cfg.DERP.UpdateFrequency != 0 {
+		derpTicker := time.NewTicker(h.cfg.DERP.UpdateFrequency)
+		defer derpTicker.Stop()
+		derpTickerChan = derpTicker.C
+	}
+
+	var extraRecordsUpdate <-chan []tailcfg.DNSRecord
+	if h.extraRecordMan != nil {
+		extraRecordsUpdate = h.extraRecordMan.UpdateCh()
+	} else {
+		extraRecordsUpdate = make(chan []tailcfg.DNSRecord)
+	}
 
 	for {
 		select {
 		case <-ctx.Done():
-			ticker.Stop()
+			log.Info().Caller().Msg("scheduled task worker is shutting down.")
 			return
-		case <-ticker.C:
+
+		case <-expireTicker.C:
+			var update types.StateUpdate
+			var changed bool
+
 			if err := h.db.Write(func(tx *gorm.DB) error {
-				lastCheck, update, changed = db.ExpireExpiredNodes(tx, lastCheck)
+				lastExpiryCheck, update, changed = db.ExpireExpiredNodes(tx, lastExpiryCheck)
 
 				return nil
 			}); err != nil {
@@ -275,24 +299,8 @@ func (h *Headscale) expireExpiredNodes(ctx context.Context, every time.Duration)
 				ctx := types.NotifyCtx(context.Background(), "expire-expired", "na")
 				h.nodeNotifier.NotifyAll(ctx, update)
 			}
-		}
-	}
-}
 
-// scheduledDERPMapUpdateWorker refreshes the DERPMap stored on the global object
-// at a set interval.
-func (h *Headscale) scheduledDERPMapUpdateWorker(cancelChan <-chan struct{}) {
-	log.Info().
-		Dur("frequency", h.cfg.DERP.UpdateFrequency).
-		Msg("Setting up a DERPMap update worker")
-	ticker := time.NewTicker(h.cfg.DERP.UpdateFrequency)
-
-	for {
-		select {
-		case <-cancelChan:
-			return
-
-		case <-ticker.C:
+		case <-derpTickerChan:
 			log.Info().Msg("Fetching DERPMap updates")
 			h.DERPMap = derp.GetDERPMap(h.cfg.DERP)
 			if h.cfg.DERP.ServerEnabled && h.cfg.DERP.AutomaticallyAddEmbeddedDerpRegion {
@@ -305,6 +313,17 @@ func (h *Headscale) scheduledDERPMapUpdateWorker(cancelChan <-chan struct{}) {
 				Type:    types.StateDERPUpdated,
 				DERPMap: h.DERPMap,
 			})
+
+		case records, ok := <-extraRecordsUpdate:
+			if !ok {
+				continue
+			}
+			h.cfg.TailcfgDNSConfig.ExtraRecords = records
+
+			ctx := types.NotifyCtx(context.Background(), "dns-extrarecord", "all")
+			// TODO(kradalby): We can probably do better than sending a full update here,
+			// but for now this will ensure that all of the nodes get the new records.
+			h.nodeNotifier.NotifyAll(ctx, types.UpdateFull())
 		}
 	}
 }
@@ -452,11 +471,13 @@ func (h *Headscale) createRouter(grpcMux *grpcRuntime.ServeMux) *mux.Router {
 	router := mux.NewRouter()
 	router.Use(prometheusMiddleware)
 
-	router.HandleFunc(ts2021UpgradePath, h.NoiseUpgradeHandler).Methods(http.MethodPost, http.MethodGet)
+	router.HandleFunc(ts2021UpgradePath, h.NoiseUpgradeHandler).
+		Methods(http.MethodPost, http.MethodGet)
 
 	router.HandleFunc("/health", h.HealthHandler).Methods(http.MethodGet)
 	router.HandleFunc("/key", h.KeyHandler).Methods(http.MethodGet)
-	router.HandleFunc("/register/{mkey}", h.authProvider.RegisterHandler).Methods(http.MethodGet)
+	router.HandleFunc("/register/{registration_id}", h.authProvider.RegisterHandler).
+		Methods(http.MethodGet)
 
 	if provider, ok := h.authProvider.(*AuthProviderOIDC); ok {
 		router.HandleFunc("/oidc/callback", provider.OIDCCallbackHandler).Methods(http.MethodGet)
@@ -491,6 +512,8 @@ func (h *Headscale) createRouter(grpcMux *grpcRuntime.ServeMux) *mux.Router {
 
 // TODO(kradalby): Do a variant of this, and polman which only updates the node that has changed.
 // Maybe we should attempt a new in memory state and not go via the DB?
+// Maybe this should be implemented as an event bus?
+// A bool is returned indicating if a full update was sent to all nodes
 func usersChangedHook(db *db.HSDatabase, polMan policy.PolicyManager, notif *notifier.Notifier) error {
 	users, err := db.ListUsers()
 	if err != nil {
@@ -504,9 +527,7 @@ func usersChangedHook(db *db.HSDatabase, polMan policy.PolicyManager, notif *not
 
 	if changed {
 		ctx := types.NotifyCtx(context.Background(), "acl-users-change", "all")
-		notif.NotifyAll(ctx, types.StateUpdate{
-			Type: types.StateFullUpdate,
-		})
+		notif.NotifyAll(ctx, types.UpdateFull())
 	}
 
 	return nil
@@ -514,29 +535,37 @@ func usersChangedHook(db *db.HSDatabase, polMan policy.PolicyManager, notif *not
 
 // TODO(kradalby): Do a variant of this, and polman which only updates the node that has changed.
 // Maybe we should attempt a new in memory state and not go via the DB?
-func nodesChangedHook(db *db.HSDatabase, polMan policy.PolicyManager, notif *notifier.Notifier) error {
+// Maybe this should be implemented as an event bus?
+// A bool is returned indicating if a full update was sent to all nodes
+func nodesChangedHook(
+	db *db.HSDatabase,
+	polMan policy.PolicyManager,
+	notif *notifier.Notifier,
+) (bool, error) {
 	nodes, err := db.ListNodes()
 	if err != nil {
-		return err
+		return false, err
 	}
 
-	changed, err := polMan.SetNodes(nodes)
+	filterChanged, err := polMan.SetNodes(nodes)
 	if err != nil {
-		return err
+		return false, err
 	}
 
-	if changed {
+	if filterChanged {
 		ctx := types.NotifyCtx(context.Background(), "acl-nodes-change", "all")
-		notif.NotifyAll(ctx, types.StateUpdate{
-			Type: types.StateFullUpdate,
-		})
+		notif.NotifyAll(ctx, types.UpdateFull())
+
+		return true, nil
 	}
 
-	return nil
+	return false, nil
 }
 
 // Serve launches the HTTP and gRPC server service Headscale and the API.
 func (h *Headscale) Serve() error {
+	capver.CanOldCodeBeCleanedUp()
+
 	if profilingEnabled {
 		if profilingPath != "" {
 			err := os.MkdirAll(profilingPath, os.ModePerm)
@@ -554,9 +583,14 @@ func (h *Headscale) Serve() error {
 		spew.Dump(h.cfg)
 	}
 
+	log.Info().Str("version", types.Version).Str("commit", types.GitCommitHash).Msg("Starting Headscale")
+	log.Info().
+		Str("minimum_version", capver.TailscaleVersion(capver.MinSupportedCapabilityVersion)).
+		Msg("Clients with a lower minimum version will be rejected")
+
 	// Fetch an initial DERP Map before we start serving
 	h.DERPMap = derp.GetDERPMap(h.cfg.DERP)
-	h.mapper = mapper.NewMapper(h.db, h.cfg, h.DERPMap, h.nodeNotifier, h.polMan)
+	h.mapper = mapper.NewMapper(h.db, h.cfg, h.DERPMap, h.nodeNotifier, h.polMan, h.primaryRoutes)
 
 	if h.cfg.DERP.ServerEnabled {
 		// When embedded DERP is enabled we always need a STUN server
@@ -576,12 +610,6 @@ func (h *Headscale) Serve() error {
 		go h.DERPServer.ServeSTUN()
 	}
 
-	if h.cfg.DERP.AutoUpdate {
-		derpMapCancelChannel := make(chan struct{})
-		defer func() { derpMapCancelChannel <- struct{}{} }()
-		go h.scheduledDERPMapUpdateWorker(derpMapCancelChannel)
-	}
-
 	if len(h.DERPMap.Regions) == 0 {
 		return errEmptyInitialDERPMap
 	}
@@ -599,9 +627,21 @@ func (h *Headscale) Serve() error {
 		h.ephemeralGC.Schedule(node.ID, h.cfg.EphemeralNodeInactivityTimeout)
 	}
 
-	expireNodeCtx, expireNodeCancel := context.WithCancel(context.Background())
-	defer expireNodeCancel()
-	go h.expireExpiredNodes(expireNodeCtx, updateInterval)
+	if h.cfg.DNSConfig.ExtraRecordsPath != "" {
+		h.extraRecordMan, err = dns.NewExtraRecordsManager(h.cfg.DNSConfig.ExtraRecordsPath)
+		if err != nil {
+			return fmt.Errorf("setting up extrarecord manager: %w", err)
+		}
+		h.cfg.TailcfgDNSConfig.ExtraRecords = h.extraRecordMan.Records()
+		go h.extraRecordMan.Run()
+		defer h.extraRecordMan.Close()
+	}
+
+	// Start all scheduled tasks, e.g. expiring nodes, derp updates and
+	// records updates
+	scheduleCtx, scheduleCancel := context.WithCancel(context.Background())
+	defer scheduleCancel()
+	go h.scheduledTasks(scheduleCtx)
 
 	if zl.GlobalLevel() == zl.TraceLevel {
 		zerolog.RespLog = true
@@ -769,26 +809,12 @@ func (h *Headscale) Serve() error {
 	log.Info().
 		Msgf("listening and serving HTTP on: %s", h.cfg.Addr)
 
-	debugMux := http.NewServeMux()
-	debugMux.Handle("/debug/pprof/", http.DefaultServeMux)
-	debugMux.HandleFunc("/debug/notifier", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(h.nodeNotifier.String()))
-	})
-	debugMux.Handle("/metrics", promhttp.Handler())
-
-	debugHTTPServer := &http.Server{
-		Addr:         h.cfg.MetricsAddr,
-		Handler:      debugMux,
-		ReadTimeout:  types.HTTPTimeout,
-		WriteTimeout: 0,
-	}
-
 	debugHTTPListener, err := net.Listen("tcp", h.cfg.MetricsAddr)
 	if err != nil {
 		return fmt.Errorf("failed to bind to TCP address: %w", err)
 	}
 
+	debugHTTPServer := h.debugHTTPServer()
 	errorGroup.Go(func() error { return debugHTTPServer.Serve(debugHTTPListener) })
 
 	log.Info().
@@ -826,6 +852,10 @@ func (h *Headscale) Serve() error {
 					Str("signal", sig.String()).
 					Msg("Received SIGHUP, reloading ACL and Config")
 
+				if h.cfg.Policy.IsEmpty() {
+					continue
+				}
+
 				if err := h.loadPolicyManager(); err != nil {
 					log.Error().Err(err).Msg("failed to reload Policy")
 				}
@@ -844,10 +874,13 @@ func (h *Headscale) Serve() error {
 					log.Info().
 						Msg("ACL policy successfully reloaded, notifying nodes of change")
 
+					err = h.autoApproveNodes()
+					if err != nil {
+						log.Error().Err(err).Msg("failed to approve routes after new policy")
+					}
+
 					ctx := types.NotifyCtx(context.Background(), "acl-sighup", "na")
-					h.nodeNotifier.NotifyAll(ctx, types.StateUpdate{
-						Type: types.StateFullUpdate,
-					})
+					h.nodeNotifier.NotifyAll(ctx, types.UpdateFull())
 				}
 			default:
 				info := func(msg string) { log.Info().Msg(msg) }
@@ -855,7 +888,7 @@ func (h *Headscale) Serve() error {
 					Str("signal", sig.String()).
 					Msg("Received signal to stop, shutting down gracefully")
 
-				expireNodeCancel()
+				scheduleCancel()
 				h.ephemeralGC.Close()
 
 				// Gracefully shut down servers
@@ -1004,13 +1037,10 @@ func notFoundHandler(
 	writer http.ResponseWriter,
 	req *http.Request,
 ) {
-	body, _ := io.ReadAll(req.Body)
-
 	log.Trace().
 		Interface("header", req.Header).
 		Interface("proto", req.Proto).
 		Interface("url", req.URL).
-		Bytes("body", body).
 		Msg("Request did not match")
 	writer.WriteHeader(http.StatusNotFound)
 }
@@ -1090,6 +1120,10 @@ func (h *Headscale) policyBytes() ([]byte, error) {
 			return nil, err
 		}
 
+		if p.Data == "" {
+			return nil, nil
+		}
+
 		return []byte(p.Data), err
 	}
 
@@ -1129,6 +1163,7 @@ func (h *Headscale) loadPolicyManager() error {
 			errOut = fmt.Errorf("creating policy manager: %w", err)
 			return
 		}
+		log.Info().Msgf("Using policy manager version: %d", h.polMan.Version())
 
 		if len(nodes) > 0 {
 			_, err = h.polMan.SSHPolicy(nodes[0])
@@ -1140,4 +1175,37 @@ func (h *Headscale) loadPolicyManager() error {
 	})
 
 	return errOut
+}
+
+// autoApproveNodes mass approves routes on all nodes. It is _only_ intended for
+// use when the policy is replaced. It is not sending or reporting any changes
+// or updates as we send full updates after replacing the policy.
+// TODO(kradalby): This is kind of messy, maybe this is another +1
+// for an event bus. See example comments here.
+func (h *Headscale) autoApproveNodes() error {
+	err := h.db.Write(func(tx *gorm.DB) error {
+		nodes, err := db.ListNodes(tx)
+		if err != nil {
+			return err
+		}
+
+		for _, node := range nodes {
+			changed := policy.AutoApproveRoutes(h.polMan, node)
+			if changed {
+				err = tx.Save(node).Error
+				if err != nil {
+					return err
+				}
+
+				h.primaryRoutes.SetRoutes(node.ID, node.SubnetRoutes()...)
+			}
+		}
+
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("auto approving routes for nodes: %w", err)
+	}
+
+	return nil
 }

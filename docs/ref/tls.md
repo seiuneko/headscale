@@ -4,7 +4,7 @@
 
 Headscale can be configured to expose its web service via TLS. To configure the certificate and key file manually, set the `tls_cert_path` and `tls_cert_path` configuration parameters. If the path is relative, it will be interpreted as relative to the directory the configuration file was read from.
 
-```yaml
+```yaml title="config.yaml"
 tls_cert_path: ""
 tls_key_path: ""
 ```
@@ -15,7 +15,7 @@ The certificate should contain the full chain, else some clients, like the Tails
 
 To get a certificate automatically via [Let's Encrypt](https://letsencrypt.org/), set `tls_letsencrypt_hostname` to the desired certificate hostname. This name must resolve to the IP address(es) headscale is reachable on (i.e., it must correspond to the `server_url` configuration parameter). The certificate and Let's Encrypt account credentials will be stored in the directory configured in `tls_letsencrypt_cache_dir`. If the path is relative, it will be interpreted as relative to the directory the configuration file was read from.
 
-```yaml
+```yaml title="config.yaml"
 tls_letsencrypt_hostname: ""
 tls_letsencrypt_listen: ":http"
 tls_letsencrypt_cache_dir: ".cache"
@@ -52,7 +52,7 @@ If you want to validate that certificate renewal completed successfully, this ca
 1. Open the URL for your headscale server in your browser of choice, and manually inspecting the expiry date of the certificate you receive.
 2. Or, check remotely from CLI using `openssl`:
 
-```bash
+```console
 $ openssl s_client -servername [hostname] -connect [hostname]:443 | openssl x509 -noout -dates
 (...)
 notBefore=Feb  8 09:48:26 2024 GMT

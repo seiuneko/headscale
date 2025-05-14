@@ -11,7 +11,7 @@ Known limitations:
 
 In your `config.yaml`, customize this to your liking:
 
-```yaml
+```yaml title="config.yaml"
 oidc:
   # Block further startup until the OIDC provider is healthy and available
   only_start_if_oidc_is_available: true
@@ -45,18 +45,24 @@ oidc:
   allowed_users:
     - alice@example.com
 
-  # If `strip_email_domain` is set to `true`, the domain part of the username email address will be removed.
-  # This will transform `first-name.last-name@example.com` to the user `first-name.last-name`
-  # If `strip_email_domain` is set to `false` the domain part will NOT be removed resulting to the following
-  # user: `first-name.last-name.example.com`
-  strip_email_domain: true
+  # Optional: PKCE (Proof Key for Code Exchange) configuration
+  # PKCE adds an additional layer of security to the OAuth 2.0 authorization code flow
+  # by preventing authorization code interception attacks
+  # See https://datatracker.ietf.org/doc/html/rfc7636
+  pkce:
+    # Enable or disable PKCE support (default: false)
+    enabled: false
+    # PKCE method to use:
+    # - plain: Use plain code verifier
+    # - S256: Use SHA256 hashed code verifier (default, recommended)
+    method: S256
 ```
 
 ## Azure AD example
 
 In order to integrate headscale with Azure Active Directory, we'll need to provision an App Registration with the correct scopes and redirect URI. Here with Terraform:
 
-```hcl
+```hcl title="terraform.hcl"
 resource "azuread_application" "headscale" {
   display_name = "Headscale"
 
@@ -127,7 +133,7 @@ output "headscale_client_secret" {
 
 And in your headscale `config.yaml`:
 
-```yaml
+```yaml title="config.yaml"
 oidc:
   issuer: "https://login.microsoftonline.com/<tenant-UUID>/v2.0"
   client_id: "<client-id-from-terraform>"
@@ -162,7 +168,7 @@ However if you don't have a domain, or need to add users outside of your domain,
 8. Click `Save` at the bottom of the form
 9. Take note of the `Client ID` and `Client secret`, you can also download it for reference if you need it.
 10. Edit your headscale config, under `oidc`, filling in your `client_id` and `client_secret`:
-    ```yaml
+    ```yaml title="config.yaml"
     oidc:
       issuer: "https://accounts.google.com"
       client_id: ""
@@ -171,3 +177,37 @@ However if you don't have a domain, or need to add users outside of your domain,
     ```
 
 You can also use `allowed_domains` and `allowed_users` to restrict the users who can authenticate.
+
+## Authelia
+Authelia since v4.39.0, has removed most claims from the `ID Token`, they are still available when application queries [UserInfo Endpoint](https://openid.net/specs/openid-connect-core-1_0.html#UserInfo). 
+
+Following config restores sending 'default' claims in the `ID Token`
+
+For more information please read: [Authelia restore functionality prior to claims parameter](https://www.authelia.com/integration/openid-connect/openid-connect-1.0-claims/#restore-functionality-prior-to-claims-parameter)
+
+
+```yaml
+identity_providers:
+  oidc:
+    claims_policies:
+      default:
+        id_token: ['groups', 'email', 'email_verified', 'alt_emails', 'preferred_username', 'name']
+    clients:
+      - client_id: 'headscale'
+        client_name: 'headscale'
+        client_secret: ''
+        public: false
+        claims_policy: 'default'
+        authorization_policy: 'two_factor'
+        require_pkce: true
+        pkce_challenge_method: 'S256'
+        redirect_uris:
+          - 'https://headscale.example.com/oidc/callback'
+        scopes:
+          - 'openid'
+          - 'profile'
+          - 'groups'
+          - 'email'
+        userinfo_signed_response_alg: 'none'
+        token_endpoint_auth_method: 'client_secret_basic'
+```

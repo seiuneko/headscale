@@ -34,13 +34,14 @@ func TestDERPVerifyEndpoint(t *testing.T) {
 	certHeadscale, keyHeadscale, err := integrationutil.CreateCertificate(hostname)
 	assertNoErr(t, err)
 
-	scenario, err := NewScenario(dockertestMaxWait())
+	spec := ScenarioSpec{
+		NodesPerUser: len(MustTestVersions),
+		Users:        []string{"user1"},
+	}
+
+	scenario, err := NewScenario(spec)
 	assertNoErr(t, err)
 	defer scenario.ShutdownAssertNoPanics(t)
-
-	spec := map[string]int{
-		"user1": len(MustTestVersions),
-	}
 
 	derper, err := scenario.CreateDERPServer("head",
 		dsic.WithCACert(certHeadscale),
@@ -69,11 +70,10 @@ func TestDERPVerifyEndpoint(t *testing.T) {
 		},
 	}
 
-	err = scenario.CreateHeadscaleEnv(spec, []tsic.Option{tsic.WithCACert(derper.GetCert())},
+	err = scenario.CreateHeadscaleEnv([]tsic.Option{tsic.WithCACert(derper.GetCert())},
 		hsic.WithHostname(hostname),
 		hsic.WithPort(headscalePort),
 		hsic.WithCustomTLS(certHeadscale, keyHeadscale),
-		hsic.WithHostnameAsServerURL(),
 		hsic.WithDERPConfig(derpMap))
 	assertNoErrHeadscaleEnv(t, err)
 
@@ -81,22 +81,23 @@ func TestDERPVerifyEndpoint(t *testing.T) {
 	assertNoErrListClients(t, err)
 
 	fakeKey := key.NewNode()
-	derpVerify(t, fakeKey, derpRegion, false)
+	DERPVerify(t, fakeKey, derpRegion, false)
 
 	for _, client := range allClients {
 		nodeKey, err := client.GetNodePrivateKey()
 		assertNoErr(t, err)
-		derpVerify(t, *nodeKey, derpRegion, true)
+		DERPVerify(t, *nodeKey, derpRegion, true)
 	}
 }
 
-func derpVerify(
-	t testing.TB,
+func DERPVerify(
+	t *testing.T,
 	nodeKey key.NodePrivate,
 	region tailcfg.DERPRegion,
 	expectSuccess bool,
 ) {
 	t.Helper()
+
 	c := derphttp.NewRegionClient(nodeKey, t.Logf, netmon.NewStatic(), func() *tailcfg.DERPRegion {
 		return &region
 	})
